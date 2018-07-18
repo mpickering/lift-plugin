@@ -20,6 +20,18 @@ test3 = test2
 test4 :: Identity (Char -> Char)
 test4 = test2
 
+test5 :: Ops p => p (a -> a)
+test5 = p foo1
+
+-- This should fail for now but in theory we should accept it as
+-- we would accept `pure return <$> pure ()`.
+--test6 :: Ops p => p (IO ())
+--test6 = p (return ())
+
+-- This should fail
+--test7 :: String
+--test7 = show id
+
 test2_naive = [|| foo ||]
 
 --test3 = p foo1

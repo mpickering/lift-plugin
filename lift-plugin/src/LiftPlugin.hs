@@ -103,9 +103,11 @@ solveLift liftTc gs ds wanteds =
 toLiftCt :: TyCon -> Ct -> Maybe Ct
 toLiftCt liftTc ct =
   case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
-    GHC.ClassPred tc _tys
+    GHC.ClassPred tc tys
      | pprTrace "classPred" (ppr (classTyCon tc) $$ ppr liftTc $$ ppr (classTyCon tc == liftTc)) True
      , classTyCon tc == liftTc
+     , [ty] <- tys
+     , GHC.isFunTy ty
       -> Just ct
     _ -> Nothing
 
