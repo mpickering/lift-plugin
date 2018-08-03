@@ -1,6 +1,6 @@
 {-# LANGUAGE TupleSections #-}
 module LiftPlugin
-  ( plugin, p, Code(..), Ops, Identity(..) )
+  ( plugin, p, Code(..), Ops, Identity(..), runCode )
 where
 
 -- external
@@ -35,6 +35,9 @@ import qualified HsExpr as Expr
 import qualified IfaceEnv as GHC
 import qualified TcEvidence as GHC
 import qualified TcRnMonad as GHC
+import qualified Panic as GHC
+import qualified ConLike as GHC
+import HsDumpAst
 import Data.Functor.Identity
 
 import Control.Monad.IO.Class ( liftIO )
@@ -50,6 +53,8 @@ class Ops r where
   p :: Lift a => a -> r a
 
 newtype Code a = Code (Q (TExp a))
+
+runCode (Code a) = a
 
 instance Ops Code where
   p = Code . unsafeTExpCoerce . lift
@@ -117,6 +122,7 @@ evMagic ct = case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
     GHC.ClassPred _tc _tys -> Just (EvExpr (Var fake_id))
     _                  -> Nothing
 
+-- What this is doens't matter really
 fake_id :: GHC.Id
 fake_id = rUNTIME_ERROR_ID
 
@@ -158,25 +164,66 @@ rewriteLiftDict _ e =
  -- pprTrace "rewriteAssert" (ppr e $$ showAstData NoBlankSrcSpan e) $
    return e
 
+
+checkLiftable_var :: Expr.LHsExpr GHC.GhcRn -> GHC.Id -> TcM (Maybe GHC.CoreExpr)
+-- Externally defined names
+checkLiftable_var body var
+ | GHC.isGlobalId var = Just <$> mkSplice body
+-- Top-level names
+checkLiftable_var body var = do
+  env <- tcg_type_env <$> GHC.getGblEnv
+  case GHC.lookupNameEnv env (GHC.idName var) of
+    Just _ -> Just <$> mkSplice body
+    Nothing -> return Nothing
+
+checkLiftable :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM (Maybe GHC.EvExpr)
+checkLiftable e | Just e' <- wrapView e = checkLiftable e'
+checkLiftable (GHC.L _ (Expr.HsVar _ v)) = checkLiftable_var (var_body $ GHC.getName v) (GHC.unLoc v)
+checkLiftable (GHC.L _ (Expr.HsConLikeOut _ c)) = do
+  Just <$> mkSplice (var_body $ GHC.getName c)
+checkLiftable _ = return Nothing
+
+wrapView :: Expr.LHsExpr GHC.GhcTc -> Maybe (GHC.LHsExpr GHC.GhcTc)
+wrapView (GHC.L l (Expr.HsWrap _ _ e)) = Just (GHC.L l e)
+wrapView _ = Nothing
+
+
 -- We take the body and then look for all the `Lift` dictionaries to
 -- replace them by a special one which ignores the argument.
 -- The only case we deal with currently is if the `body` is a simple
 -- variable. This won't deal with polymorphic functions yet.
 repair :: Expr.LHsExpr GHC.GhcTc -> GHC.EvExpr -> GHC.TcM (GHC.EvExpr)
-repair (GHC.L _ (Expr.HsVar _ v)) e =
+repair expr e = do
   let e_ty = GHC.exprType e
       (ty_con, tys) = GHC.splitTyConApp e_ty
       res = ty_con `GHC.hasKey` GHC.liftClassKey
-  in pprTrace "repair" (ppr ty_con $$ ppr tys $$ ppr res) $
+  pprTrace "repair" (ppr ty_con $$ ppr tys $$ ppr res) $
     if (ty_con `GHC.hasKey` GHC.liftClassKey)
         && GHC.isFunTy (head tys)
       then do
-              core_e <- mkSplice (GHC.unLoc v)
-              return $ mkLiftDictionary (tyConSingleDataCon ty_con) e_ty core_e
-      else return e
-repair v e =
-  pprTrace "Skipping" (ppr v) $
-    return e
+        mres <- checkLiftable expr
+        case mres of
+          Just evidence -> return $ mkLiftDictionary (tyConSingleDataCon ty_con) e_ty evidence
+          Nothing -> do
+            makeError expr
+            -- Return e to keep going
+            return e
+            --GHC.panicDoc "skipping" (ppr expr $$ showAstData BlankSrcSpan expr)
+      else
+        pprTrace "skipping1" (ppr expr) $
+        return e
+
+makeError :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM ()
+makeError (GHC.L l e) =
+  GHC.setSrcSpan l $
+  GHC.addErrCtxt (text "In" <+> ppr e) $
+  GHC.failWithTc msg
+  where
+    msg = text "Unable to magically lift the argument."
+          <+> text "It probably isn't statically known."
+
+
+
 
 {-
   mb_local_use <- GHC.getStageAndBindLevel (GHC.idName v)
@@ -188,11 +235,19 @@ repair v e =
 repair e = return e
 -}
 
-mkSplice :: GHC.Id -> TcM CoreExpr
-mkSplice v = do
+var_body :: GHC.Name -> Expr.LHsExpr GHC.GhcRn
+var_body v = (GHC.noLoc (Expr.HsVar GHC.noExt (GHC.noLoc v)))
+
+con_pat_body :: GHC.Name -> Expr.LHsExpr GHC.GhcRn
+con_pat_body v = GHC.noLoc (Expr.RecordCon GHC.noExt (GHC.noLoc v) flds)
+  where
+    flds = GHC.HsRecFields [] Nothing
+
+mkSplice :: Expr.LHsExpr GHC.GhcRn -> TcM CoreExpr
+mkSplice body = do
   hs_env  <- GHC.getTopEnv
   -- [|| var ||]
-  let e = GHC.noLoc $ Expr.HsTcBracketOut GHC.noExt (Expr.TExpBr GHC.noExt (GHC.noLoc (Expr.HsVar GHC.noExt (GHC.noLoc $ GHC.idName v)))) []
+  let e = GHC.noLoc $ Expr.HsTcBracketOut GHC.noExt (Expr.TExpBr GHC.noExt body) []
 
   ( _, mbe ) <- liftIO ( GHC.deSugarExpr hs_env e )
 

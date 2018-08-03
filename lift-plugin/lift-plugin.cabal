@@ -19,7 +19,7 @@ library
   exposed-modules: LiftPlugin
   -- other-modules:
   -- other-extensions:
-  build-depends:       base >=4.10 && <4.12, ghc-tcplugins-extra, ghc
+  build-depends:       base >=4.12 && <4.13, ghc-tcplugins-extra, ghc
                        , template-haskell, syb
   hs-source-dirs:      src
   ghc-options: -Wall

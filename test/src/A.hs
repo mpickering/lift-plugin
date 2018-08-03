@@ -23,6 +23,12 @@ test4 = test2
 test5 :: Ops p => p (a -> a)
 test5 = p foo1
 
+test7 :: Ops p => p (a -> Maybe a)
+test7 = p Just
+
+--test6 :: Ops p => (a -> a) -> p (a -> a)
+--test6 f = p f
+
 -- This should fail for now but in theory we should accept it as
 -- we would accept `pure return <$> pure ()`.
 --test6 :: Ops p => p (IO ())
@@ -33,6 +39,10 @@ test5 = p foo1
 --test7 = show id
 
 test2_naive = [|| foo ||]
+
+test_con = [|| Just ||]
+
+test_foo1 = [|| foo1 ||]
 
 --test3 = p foo1
 
