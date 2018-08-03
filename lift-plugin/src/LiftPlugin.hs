@@ -1,6 +1,6 @@
 {-# LANGUAGE TupleSections #-}
 module LiftPlugin
-  ( plugin, p, Code(..), Ops, Identity(..), runCode )
+  ( plugin, Pure(..) )
 where
 
 -- external
@@ -35,32 +35,18 @@ import qualified HsExpr as Expr
 import qualified IfaceEnv as GHC
 import qualified TcEvidence as GHC
 import qualified TcRnMonad as GHC
-import qualified Panic as GHC
-import qualified ConLike as GHC
-import HsDumpAst
-import Data.Functor.Identity
 
 import Control.Monad.IO.Class ( liftIO )
 
 import Data.Generics ( everywhereM,  mkM )
 
 
-import Language.Haskell.TH.Syntax (Lift(..), unsafeTExpCoerce, TExp, Q)
+import Language.Haskell.TH.Syntax (Lift(..))
 
 -- Library
 
-class Ops r where
-  p :: Lift a => a -> r a
-
-newtype Code a = Code (Q (TExp a))
-
-runCode (Code a) = a
-
-instance Ops Code where
-  p = Code . unsafeTExpCoerce . lift
-
-instance Ops Identity where
-  p = Identity
+class Pure r where
+  pure :: Lift a => a -> r a
 
 -- Plugin definitions
 
@@ -145,7 +131,7 @@ replaceLiftDicts _opts _sum tc_env = do
   -- This is the identifier we want to give some magic behaviour
   pName <-
     GHC.lookupId
-      =<< GHC.lookupOrig pluginModule ( GHC.mkVarOcc "p" )
+      =<< GHC.lookupOrig pluginModule ( GHC.mkVarOcc "pure" )
 
   -- We now look everywhere for it and replace the `Lift` dictionaries
   -- where we find it.
@@ -237,11 +223,6 @@ repair e = return e
 
 var_body :: GHC.Name -> Expr.LHsExpr GHC.GhcRn
 var_body v = (GHC.noLoc (Expr.HsVar GHC.noExt (GHC.noLoc v)))
-
-con_pat_body :: GHC.Name -> Expr.LHsExpr GHC.GhcRn
-con_pat_body v = GHC.noLoc (Expr.RecordCon GHC.noExt (GHC.noLoc v) flds)
-  where
-    flds = GHC.HsRecFields [] Nothing
 
 mkSplice :: Expr.LHsExpr GHC.GhcRn -> TcM CoreExpr
 mkSplice body = do
