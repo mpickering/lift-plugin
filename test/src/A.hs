@@ -42,6 +42,18 @@ test5 = pure foo1
 test7 :: Pure p => p (a -> Maybe a)
 test7 = pure Just
 
+{-
+- - These should all fail
+test8 :: Q Exp
+test8 = lift id
+
+l :: (a -> a) -> Q Exp
+l = lift
+
+test9 :: Q Exp
+test9 = l id
+-}
+
 --test6 :: Pure p => (a -> a) -> p (a -> a)
 --test6 f = pure f
 

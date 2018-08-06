@@ -1,4 +1,6 @@
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 module LiftPlugin
   ( plugin, Pure(..) )
 where
@@ -22,6 +24,10 @@ import Outputable
 import Class
 import MkCore
 import CoreSyn
+import Bag
+import MonadUtils
+import TcErrors
+import Literal
 import qualified Unique as GHC
 import qualified THNames as GHC
 
@@ -37,11 +43,26 @@ import qualified TcEvidence as GHC
 import qualified TcRnMonad as GHC
 
 import Control.Monad.IO.Class ( liftIO )
+import Control.Monad
 
-import Data.Generics ( everywhereM,  mkM )
+import Data.Generics ( everywhereM,  mkM, listify )
 
 
 import Language.Haskell.TH.Syntax (Lift(..))
+
+import Data.IORef
+import System.IO.Unsafe
+
+-- In this IORef we store how we would have reported the error
+ioRef :: IORef (Int, [TcM ()])
+ioRef = unsafePerformIO (newIORef (0, []))
+{-# NOINLINE ioRef #-}
+
+addError :: TcM () -> IO Int
+addError err = atomicModifyIORef ioRef (\(k, errs) -> ((k+1, errs ++ [err]), k))
+
+getError :: Int -> IO (TcM ())
+getError k = (!! k) . snd <$> readIORef ioRef
 
 -- Library
 
@@ -80,10 +101,11 @@ solveLift :: TyCon -- ^ Lift's TyCon
          -> TcPluginM TcPluginResult
 solveLift _     _ _ []      = return (TcPluginOk [] [])
 solveLift liftTc gs ds wanteds =
-  pprTrace "solveGCD" (ppr gs $$ ppr ds $$ ppr wanteds) $
-  (return $! case failed of
-    [] -> TcPluginOk (mapMaybe (\c -> (,c) <$> evMagic c) solved) []
-    f  -> TcPluginContradiction f)
+  pprTrace "solveGCD" (ppr gs $$ ppr ds $$ ppr wanteds) $ do
+    res <- mapMaybeM (\c -> fmap (, c) <$> evMagic c) solved
+    return $! case failed of
+      [] -> TcPluginOk res []
+      f  -> TcPluginContradiction f
   where
     liftWanteds :: [Ct]
     liftWanteds = mapMaybe (toLiftCt liftTc) wanteds
@@ -102,15 +124,38 @@ toLiftCt liftTc ct =
       -> Just ct
     _ -> Nothing
 
+mkWC :: Ct -> WantedConstraints
+mkWC ct = WC (unitBag ct) emptyBag
+
+addErrTc :: TcM () -> TcPluginM Int
+addErrTc err = unsafeTcPluginTcM (liftIO (addError err))
+getErrTc :: Int -> TcM ()
+getErrTc k = join (liftIO (getError k))
+
+
 -- | TODO: Check here for (->) instance
-evMagic :: Ct -> Maybe EvTerm
+evMagic :: Ct -> TcPluginM (Maybe EvTerm)
 evMagic ct = case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
-    GHC.ClassPred _tc _tys -> Just (EvExpr (Var fake_id))
-    _                  -> Nothing
+    GHC.ClassPred _tc _tys -> do
+      let reporter = reportAllUnsolved (mkWC ct)
+      k <- addErrTc reporter
+      return $ Just (EvExpr (FakeExpr k))
+    _                  -> return Nothing
 
 -- What this is doens't matter really
 fake_id :: GHC.Id
 fake_id = rUNTIME_ERROR_ID
+
+is_fake_id :: GHC.Id -> Bool
+is_fake_id = (== fake_id)
+
+fake_expr :: Int -> Expr GHC.Id
+fake_expr k = App (Var fake_id) (Lit $ LitNumber LitNumInteger (fromIntegral k) GHC.intTy)
+
+pattern FakeExpr :: Int -> Expr GHC.Id
+pattern FakeExpr k <- App (Var (is_fake_id -> True)) (Lit (LitNumber LitNumInteger (fromIntegral -> k) _))
+  where
+    FakeExpr k = fake_expr k
 
 -----------------------------------------------------------------------------
 -- The source plugin which fills in the dictionaries magically.
@@ -118,7 +163,9 @@ fake_id = rUNTIME_ERROR_ID
 replaceLiftDicts :: [GHC.CommandLineOption] -> GHC.ModSummary -> TcGblEnv -> TcM TcGblEnv
 replaceLiftDicts _opts _sum tc_env = do
   hscEnv <- GHC.getTopEnv
-
+  v <- liftIO (readIORef ioRef)
+  pprTrace "ioRef" (ppr (length v)) (return ())
+  --getErrTc 0
 
   GHC.Found _ pluginModule <-
     liftIO
@@ -137,6 +184,9 @@ replaceLiftDicts _opts _sum tc_env = do
   -- where we find it.
   new_tcg_binds <-
      mkM ( rewriteLiftDict pName ) `everywhereM` GHC.tcg_binds tc_env
+
+  -- Check if there are any instances which remain unsolved
+  checkUsages (GHC.tcg_ev_binds tc_env) new_tcg_binds
 
   return tc_env { GHC.tcg_binds = new_tcg_binds }
 
@@ -243,3 +293,35 @@ mkLiftDictionary dc ty splice =
   let lvar = GHC.mkTemplateLocal 0 ty
   in mkCoreConApps dc [Type ty, mkCoreLams [lvar] splice]
 
+---- Checking Usages
+-- TODO: I think we could store the landmine usage from the Ct information
+-- in the type checking plugin
+checkUsages :: Bag EvBind -> GHC.LHsBinds GHC.GhcTc -> TcM ()
+checkUsages (bagToList -> bs) binds = do
+  let landmines = getFakeDicts bs
+      -- TODO: Use synthesise here?
+      go :: TcEvBinds -> Bool
+      go (EvBinds _) = True
+      go _ = False
+      extract = concatMap (\(EvBinds b) -> getFakeDicts (bagToList b))
+      landmines' = extract $ listify go binds
+      -- Get all variable usages, we don't want any landmines to appear.
+      all_vars :: EvExpr -> Bool
+      all_vars (Var _) = True
+      all_vars _ = False
+      usages = map (\(Var v) -> v) (listify all_vars binds)
+  pprTrace "landmines" (ppr landmines) (return ())
+  pprTrace "landmines'" (ppr landmines') (return ())
+  pprTrace "usages" (ppr usages) (return ())
+  pprTrace "dicts" (ppr bs) (return ())
+  mapM_ (checkMine usages) (landmines ++ landmines')
+
+-- Check whether a mine appears in the program.
+checkMine :: [GHC.EvVar] -> (GHC.EvVar, Int) -> TcM ()
+checkMine uses (v, k) = when (v `elem` uses) (getErrTc k)
+
+getFakeDicts :: [EvBind] -> [(GHC.EvVar, Int)]
+getFakeDicts = mapMaybe getFakeDict
+  where
+    getFakeDict (EvBind r (EvExpr (FakeExpr k)) _) = Just (r, k)
+    getFakeDict _ = Nothing
