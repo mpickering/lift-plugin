@@ -1,8 +1,13 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFoldable #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE DeriveGeneric #-}
 module LiftPlugin
-  ( plugin, Pure(..) )
+  ( plugin, Pure(..), Syntax(..) )
 where
 
 -- external
@@ -45,7 +50,10 @@ import qualified TcRnMonad as GHC
 import Control.Monad.IO.Class ( liftIO )
 import Control.Monad
 
-import Data.Generics ( everywhereM,  mkM, listify )
+import Data.Generics ( everywhereM,  mkM, listify, everywhere, mkT )
+import Data.List
+
+import GHC.Generics
 
 
 import Language.Haskell.TH.Syntax (Lift(..))
@@ -69,10 +77,37 @@ getError k = (!! k) . snd <$> readIORef ioRef
 class Pure r where
   pure :: Lift a => a -> r a
 
+-- Syntax we can overload
+class (Pure r) => Syntax r where
+  _if :: r Bool -> r a -> r a -> r a
+  _uncons ::  r [a] -> (r a -> r [a] -> r res) -> r res -> r res
+  _lam :: (r a -> r b) -> r (a -> b)
+  _let :: r a -> (r a -> r b) -> r b
+  _elim_prod :: r (a, b) -> (r a -> r b -> r x) -> r x
+  _ap :: r (a -> b) -> r a -> r b
+
+data Names a = Names
+  { pureName, ifName, unconsName, lamName, letName, elimProdName, apName :: a }
+  deriving (Functor, Traversable, Foldable, Generic)
+
+namesString :: Names String
+namesString =
+  Names
+    { pureName = "pure"
+    , ifName = "_if"
+    , unconsName = "_uncons"
+    , lamName = "_lam"
+    , letName = "_let"
+    , elimProdName = "_elim_prod"
+    , apName = "_ap"
+    }
+
+
 -- Plugin definitions
 
 plugin :: Plugin
-plugin = defaultPlugin { tcPlugin = const (Just liftPlugin)
+plugin = defaultPlugin { parsedResultAction = overloadedSyntax
+                       , tcPlugin = const (Just liftPlugin)
                        , typeCheckResultAction = replaceLiftDicts }
 
 liftPlugin :: TcPlugin
@@ -160,6 +195,9 @@ pattern FakeExpr k <- App (Var (is_fake_id -> True)) (Lit (LitNumber LitNumInteg
 -----------------------------------------------------------------------------
 -- The source plugin which fills in the dictionaries magically.
 
+lookupNames :: GHC.Module -> Names String -> TcM (Names GHC.Id)
+lookupNames pm = traverse (\s -> GHC.lookupId =<< GHC.lookupOrig pm (GHC.mkVarOcc s))
+
 replaceLiftDicts :: [GHC.CommandLineOption] -> GHC.ModSummary -> TcGblEnv -> TcM TcGblEnv
 replaceLiftDicts _opts _sum tc_env = do
   hscEnv <- GHC.getTopEnv
@@ -176,14 +214,12 @@ replaceLiftDicts _opts _sum tc_env = do
       )
 
   -- This is the identifier we want to give some magic behaviour
-  pName <-
-    GHC.lookupId
-      =<< GHC.lookupOrig pluginModule ( GHC.mkVarOcc "pure" )
+  Names{..} <- lookupNames pluginModule namesString
 
   -- We now look everywhere for it and replace the `Lift` dictionaries
   -- where we find it.
   new_tcg_binds <-
-     mkM ( rewriteLiftDict pName ) `everywhereM` GHC.tcg_binds tc_env
+     mkM ( rewriteLiftDict pureName ) `everywhereM` GHC.tcg_binds tc_env
 
   -- Check if there are any instances which remain unsolved
   checkUsages (GHC.tcg_ev_binds tc_env) new_tcg_binds
@@ -325,3 +361,29 @@ getFakeDicts = mapMaybe getFakeDict
   where
     getFakeDict (EvBind r (EvExpr (FakeExpr k)) _) = Just (r, k)
     getFakeDict _ = Nothing
+
+
+{-----------------------------------------------------------------------------
+-  The parser plugin - implement our own overloaded syntax
+-  --------------------------------------------------------------------------}
+
+overloadedSyntax
+  :: [GHC.CommandLineOption] -> GHC.ModSummary -> GHC.HsParsedModule
+                                               -> GHC.Hsc GHC.HsParsedModule
+overloadedSyntax _opts _ms parsed_mod
+  =
+  let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
+            . GHC.mkRdrUnqual . GHC.mkVarOcc
+      namesRDR = fmap mkVar namesString
+      new_mod = (everywhere (mkT (overload namesRDR)) (GHC.hpm_module parsed_mod))
+  in return (parsed_mod { GHC.hpm_module = new_mod })
+
+overload :: Names (Expr.LHsExpr GHC.GhcPs) -> Expr.LHsExpr GHC.GhcPs -> Expr.LHsExpr GHC.GhcPs
+overload Names{..} (GHC.L l e) = go e
+  where
+    go (Expr.HsIf _ext _ p te fe) =
+      pprTrace "Replacing if" (ppr e)
+       $ foldl' GHC.mkHsApp ifName [p, te, fe]
+    go expr = GHC.L l expr
+
+
