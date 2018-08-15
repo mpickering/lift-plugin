@@ -36,8 +36,11 @@ import MonadUtils
 import TcErrors
 import Literal
 import PrelNames
+import HsDumpAst
 import qualified Unique as GHC
 import qualified THNames as GHC
+
+import Panic
 
 
 -- ghc
@@ -448,7 +451,7 @@ check_pure Names{..} (GHC.L _ e) = go e
     go _ = False
 
 overloadExpr :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
-overloadExpr Names{..} (GHC.L l e) = go e
+overloadExpr names@Names{..} le@(GHC.L l e) = go e
   where
     -- Don't replace applications of `pure x`.
     go (Expr.HsIf _ext _ p te fe) =
@@ -457,7 +460,32 @@ overloadExpr Names{..} (GHC.L l e) = go e
     go (Expr.HsApp _exp e1 e2) =
       pprTrace "Replacing app" (ppr e)
        $ foldl' GHC.mkHsApp (mkExpr apName) [e1, e2]
+    go (Expr.HsLam {}) =
+      pprTrace "Replacing lam" (ppr e)
+       $ GHC.mkHsApp (mkExpr lamName) le
+    go (Expr.HsLet _ binds let_rhs) =
+      let (binder, rhs) = extractBindInfo binds
+          pats = [GHC.noLoc $ GHC.VarPat GHC.noExt binder]
+          matches = GHC.mkMatchGroup GHC.Generated [GHC.mkSimpleMatch Expr.LambdaExpr pats let_rhs]
+          body_lam = GHC.noLoc $ GHC.HsLam GHC.noExt matches
+      in
+        pprTrace "Replacing let" (ppr e $$ ppr rhs $$ ppr body_lam )
+          $ foldl' GHC.mkHsApp (mkExpr letName) [overloadExpr names rhs, body_lam]
 
     go expr = GHC.L l expr
+
+-- Get the binder and body of let
+extractBindInfo :: GHC.LHsLocalBinds GHC.GhcRn -> (GHC.Located GHC.Name, GHC.LHsExpr GHC.GhcRn)
+extractBindInfo (GHC.L _ (GHC.HsValBinds _ (GHC.XValBindsLR (GHC.NValBinds binds _)))) = getBinds binds
+  where
+    getBinds bs =
+      let [rs] = map snd bs
+      in
+      case bagToList rs of
+        [GHC.L _ (GHC.FunBind _ bid matches _ _)] ->
+          (bid, GHC.noLoc $ Expr.HsLam GHC.noExt matches)
+        _ -> panic "abc"
+extractBindInfo e = panicDoc "abc2" (showAstData BlankSrcSpan e)
+
 
 

@@ -83,5 +83,18 @@ appTest = overload $ (pure const) (pure True) (pure False)
 pureTest :: Syntax r => r (Int)
 pureTest = overload $ pure (id 5)
 
+lamTest :: Syntax r => r (a -> a)
+lamTest = overload $ \a -> a
+
+{-
+letTest :: Syntax r => r Bool
+letTest = overload $ let t = True
+                     in t
+                     -}
+
+letTest :: Syntax r => r Bool
+letTest = overload $ let t x = x
+                     in t (pure True)
+
 
 
