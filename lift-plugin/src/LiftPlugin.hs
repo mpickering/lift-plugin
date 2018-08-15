@@ -81,12 +81,16 @@ class Pure r where
 
 -- Syntax we can overload
 class (Pure r) => Syntax r where
+  -- Simple overloading
   _if :: r Bool -> r a -> r a -> r a
-  _uncons ::  r [a] -> (r a -> r [a] -> r res) -> r res -> r res
   _lam :: (r a -> r b) -> r (a -> b)
   _let :: r a -> (r a -> r b) -> r b
-  _elim_prod :: r (a, b) -> (r a -> r b -> r x) -> r x
   _ap :: r (a -> b) -> r a -> r b
+
+
+  -- Case overloading
+  _uncons ::  r [a] -> (r a -> r [a] -> r res) -> r res -> r res
+  _elim_prod :: r (a, b) -> (r a -> r b -> r x) -> r x
 
 
 overload :: Syntax r => a -> r a
@@ -405,7 +409,8 @@ is_dollar = (== dollarName)
 pattern DollarVarApp :: GHC.Name -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 pattern DollarVarApp v e <- (GHC.unLoc -> Expr.OpApp _ (GHC.unLoc -> Expr.HsVar _ (GHC.unLoc -> v)) (GHC.unLoc -> Expr.HsVar _ (is_dollar . GHC.unLoc -> True)) e)
 
-
+-- Look for direct applications of `overload e` or `overload $ e` and then
+-- perform the overloading.
 overload_guard :: Names GHC.Name -> Expr.LHsExpr GHC.GhcRn
                                                  -> Expr.LHsExpr GHC.GhcRn
 overload_guard names old_e =
@@ -422,19 +427,29 @@ check_overload_app names@(Names { overloadName } ) v e old_e
   | v == overloadName = overload_scope names e
   | otherwise = old_e
 
+-- Now perform the overriding just on the expression in this scope.
 overload_scope :: Names GHC.Name -> Expr.LHsExpr GHC.GhcRn
                                                  -> Expr.LHsExpr GHC.GhcRn
 overload_scope names e =
     let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
-        namesExpr = fmap mkVar names
+        namesExpr = fmap (\n -> ExprWithName n (mkVar n)) names
     in everywhere (mkT (overloadExpr namesExpr)) e
 
-overloadExpr :: Names (Expr.LHsExpr GHC.GhcRn) -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
+data ExprWithName = ExprWithName { ename :: GHC.Name, mkExpr :: (Expr.LHsExpr GHC.GhcRn) }
+
+overloadExpr :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 overloadExpr Names{..} (GHC.L l e) = go e
   where
+    -- Don't replace applications of `pure x`.
+    go (Expr.HsApp _exp (GHC.L _ (Expr.HsVar _ name)) _)
+      | GHC.unLoc name == ename pureName = GHC.L l e
     go (Expr.HsIf _ext _ p te fe) =
       pprTrace "Replacing if" (ppr e)
-       $ foldl' GHC.mkHsApp ifName [p, te, fe]
+       $ foldl' GHC.mkHsApp (mkExpr ifName) [p, te, fe]
+    go (Expr.HsApp _exp e1 e2) =
+      pprTrace "Replacing app" (ppr e)
+       $ foldl' GHC.mkHsApp (mkExpr apName) [e1, e2]
+
     go expr = GHC.L l expr
 
 

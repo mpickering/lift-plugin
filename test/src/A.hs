@@ -77,5 +77,8 @@ test_foo1 = [|| foo1 ||]
 ifTest :: Syntax r => r Bool
 ifTest = overload $ if (pure True) then (pure False) else (pure True)
 
+appTest :: Syntax r => r Bool
+appTest = overload $ (pure const) (pure True) (pure False)
+
 
 
