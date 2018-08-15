@@ -6,8 +6,9 @@
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE NamedFieldPuns #-}
 module LiftPlugin
-  ( plugin, Pure(..), Syntax(..) )
+  ( plugin, Pure(..), Syntax(..), overload )
 where
 
 -- external
@@ -86,8 +87,14 @@ class (Pure r) => Syntax r where
   _elim_prod :: r (a, b) -> (r a -> r b -> r x) -> r x
   _ap :: r (a -> b) -> r a -> r b
 
+
+overload :: Syntax r => a -> r a
+overload = undefined
+{-# NOINLINE overload #-}
+
 data Names a = Names
-  { pureName, ifName, unconsName, lamName, letName, elimProdName, apName :: a }
+  { pureName, ifName, unconsName, lamName, letName, elimProdName, apName
+    , overloadName :: a }
   deriving (Functor, Traversable, Foldable, Generic)
 
 namesString :: Names String
@@ -100,6 +107,7 @@ namesString =
     , letName = "_let"
     , elimProdName = "_elim_prod"
     , apName = "_ap"
+    , overloadName = "overload"
     }
 
 
@@ -373,7 +381,7 @@ getFakeDicts = mapMaybe getFakeDict
 overloadedSyntax
   :: [GHC.CommandLineOption] -> TcGblEnv -> GHC.HsGroup GHC.GhcRn
                                          -> TcM (TcGblEnv, GHC.HsGroup GHC.GhcRn)
-overloadedSyntax _opts tc_gbl_env group = do
+overloadedSyntax _opts tc_gbl_env rn_group = do
   hscEnv <- GHC.getTopEnv
   GHC.Found _ pluginModule <-
     liftIO
@@ -384,13 +392,24 @@ overloadedSyntax _opts tc_gbl_env group = do
       )
   namesName <- lookupNames pluginModule namesString
 
-  let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
-      namesExpr = fmap mkVar namesName
-      new_group = everywhere (mkT (overload namesExpr)) group
+  let new_group = everywhere (mkT (overload_guard namesName)) rn_group
   return (tc_gbl_env, new_group)
 
-overload :: Names (Expr.LHsExpr GHC.GhcRn) -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
-overload Names{..} (GHC.L l e) = go e
+pattern VarApp :: GHC.Name -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
+pattern VarApp v e <- (GHC.unLoc -> Expr.HsApp _ (GHC.unLoc -> Expr.HsVar _ (GHC.unLoc -> v)) e)
+
+overload_guard :: Names GHC.Name -> Expr.LHsExpr GHC.GhcRn
+                                                 -> Expr.LHsExpr GHC.GhcRn
+overload_guard names@(Names{ overloadName }) old_e@(VarApp v e)
+  | v == overloadName =
+    let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
+        namesExpr = fmap mkVar names
+    in everywhere (mkT (overloadExpr namesExpr)) e
+  | otherwise = old_e
+overload_guard _ e = e
+
+overloadExpr :: Names (Expr.LHsExpr GHC.GhcRn) -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
+overloadExpr Names{..} (GHC.L l e) = go e
   where
     go (Expr.HsIf _ext _ p te fe) =
       pprTrace "Replacing if" (ppr e)
