@@ -483,7 +483,7 @@ extractBindInfo names (GHC.L _ (GHC.HsValBinds _ (GHC.XValBindsLR (GHC.NValBinds
       in
       case bagToList rs of
         [GHC.L _ (GHC.FunBind _ bid matches _ _)] ->
-          case isSingletonMatchGroup matches >>= simpleGRHS of
+          case isSimpleMatchGroup matches of
             Just simple -> (bid, simple)
             _ -> (bid, overloadExpr names (GHC.noLoc $ Expr.HsLam GHC.noExt matches))
         -- Not dealing with guards here yet but they could be
@@ -497,13 +497,14 @@ simpleGRHS grhs =
     (Expr.GRHS _ [] body) -> Just body
     _ -> Nothing
 
-
--- | Is there only one RHS in this list of matches?
-isSingletonMatchGroup :: Expr.MatchGroup id body -> Maybe (Expr.GRHS id body)
-isSingletonMatchGroup (Expr.MG { mg_alts = matches })
+-- A simple match group is one which is just a variable with no
+-- arguments.
+-- let x = y
+isSimpleMatchGroup :: Expr.MatchGroup id body -> Maybe body
+isSimpleMatchGroup (Expr.MG { mg_alts = matches })
   | [GHC.L _ match] <- GHC.unLoc matches
   , Expr.Match { m_grhss = GHC.GRHSs { grhssGRHSs = [rhs] }
                , m_pats = [] } <- match
-  = Just (GHC.unLoc rhs)
+  = simpleGRHS (GHC.unLoc rhs)
   | otherwise
   = Nothing
