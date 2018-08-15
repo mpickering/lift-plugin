@@ -7,6 +7,7 @@
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE TypeFamilies #-}
 module LiftPlugin
   ( plugin, Pure(..), Syntax(..), overload )
 where
@@ -52,7 +53,8 @@ import qualified TcRnMonad as GHC
 import Control.Monad.IO.Class ( liftIO )
 import Control.Monad
 
-import Data.Generics ( everywhereM,  mkM, listify, everywhere, mkT )
+import Data.Generics ( everywhereM,  mkM, listify, everywhere, mkT
+                     , everywhereBut, mkQ )
 import Data.List
 
 import GHC.Generics
@@ -433,16 +435,22 @@ overload_scope :: Names GHC.Name -> Expr.LHsExpr GHC.GhcRn
 overload_scope names e =
     let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
         namesExpr = fmap (\n -> ExprWithName n (mkVar n)) names
-    in everywhere (mkT (overloadExpr namesExpr)) e
+    in everywhereBut (mkQ False (check_pure namesExpr)) (mkT (overloadExpr namesExpr)) e
 
 data ExprWithName = ExprWithName { ename :: GHC.Name, mkExpr :: (Expr.LHsExpr GHC.GhcRn) }
+
+-- Don't recurse into pure
+check_pure :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Bool
+check_pure Names{..} (GHC.L _ e) = go e
+  where
+    go (Expr.HsApp _exp (GHC.L _ (Expr.HsVar _ name)) _)
+      | GHC.unLoc name == ename pureName = True
+    go _ = False
 
 overloadExpr :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 overloadExpr Names{..} (GHC.L l e) = go e
   where
     -- Don't replace applications of `pure x`.
-    go (Expr.HsApp _exp (GHC.L _ (Expr.HsVar _ name)) _)
-      | GHC.unLoc name == ename pureName = GHC.L l e
     go (Expr.HsIf _ext _ p te fe) =
       pprTrace "Replacing if" (ppr e)
        $ foldl' GHC.mkHsApp (mkExpr ifName) [p, te, fe]

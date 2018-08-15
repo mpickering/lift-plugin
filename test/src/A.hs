@@ -80,5 +80,8 @@ ifTest = overload $ if (pure True) then (pure False) else (pure True)
 appTest :: Syntax r => r Bool
 appTest = overload $ (pure const) (pure True) (pure False)
 
+pureTest :: Syntax r => r (Int)
+pureTest = overload $ pure (id 5)
+
 
 
