@@ -106,7 +106,7 @@ namesString =
 -- Plugin definitions
 
 plugin :: Plugin
-plugin = defaultPlugin { parsedResultAction = overloadedSyntax
+plugin = defaultPlugin { renamedResultAction = overloadedSyntax
                        , tcPlugin = const (Just liftPlugin)
                        , typeCheckResultAction = replaceLiftDicts }
 
@@ -195,8 +195,11 @@ pattern FakeExpr k <- App (Var (is_fake_id -> True)) (Lit (LitNumber LitNumInteg
 -----------------------------------------------------------------------------
 -- The source plugin which fills in the dictionaries magically.
 
-lookupNames :: GHC.Module -> Names String -> TcM (Names GHC.Id)
-lookupNames pm = traverse (\s -> GHC.lookupId =<< GHC.lookupOrig pm (GHC.mkVarOcc s))
+lookupIds :: GHC.Module -> Names String -> TcM (Names GHC.Id)
+lookupIds pm = traverse (\s -> GHC.lookupId =<< GHC.lookupOrig pm (GHC.mkVarOcc s))
+
+lookupNames :: GHC.Module -> Names String -> TcM (Names GHC.Name)
+lookupNames pm = traverse (\s -> GHC.lookupOrig pm (GHC.mkVarOcc s))
 
 replaceLiftDicts :: [GHC.CommandLineOption] -> GHC.ModSummary -> TcGblEnv -> TcM TcGblEnv
 replaceLiftDicts _opts _sum tc_env = do
@@ -214,7 +217,7 @@ replaceLiftDicts _opts _sum tc_env = do
       )
 
   -- This is the identifier we want to give some magic behaviour
-  Names{..} <- lookupNames pluginModule namesString
+  Names{..} <- lookupIds pluginModule namesString
 
   -- We now look everywhere for it and replace the `Lift` dictionaries
   -- where we find it.
@@ -368,17 +371,25 @@ getFakeDicts = mapMaybe getFakeDict
 -  --------------------------------------------------------------------------}
 
 overloadedSyntax
-  :: [GHC.CommandLineOption] -> GHC.ModSummary -> GHC.HsParsedModule
-                                               -> GHC.Hsc GHC.HsParsedModule
-overloadedSyntax _opts _ms parsed_mod
-  =
-  let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
-            . GHC.mkRdrUnqual . GHC.mkVarOcc
-      namesRDR = fmap mkVar namesString
-      new_mod = (everywhere (mkT (overload namesRDR)) (GHC.hpm_module parsed_mod))
-  in return (parsed_mod { GHC.hpm_module = new_mod })
+  :: [GHC.CommandLineOption] -> TcGblEnv -> GHC.HsGroup GHC.GhcRn
+                                         -> TcM (TcGblEnv, GHC.HsGroup GHC.GhcRn)
+overloadedSyntax _opts tc_gbl_env group = do
+  hscEnv <- GHC.getTopEnv
+  GHC.Found _ pluginModule <-
+    liftIO
+      ( GHC.findImportedModule
+          hscEnv
+          ( GHC.mkModuleName "LiftPlugin" )
+          Nothing
+      )
+  namesName <- lookupNames pluginModule namesString
 
-overload :: Names (Expr.LHsExpr GHC.GhcPs) -> Expr.LHsExpr GHC.GhcPs -> Expr.LHsExpr GHC.GhcPs
+  let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
+      namesExpr = fmap mkVar namesName
+      new_group = everywhere (mkT (overload namesExpr)) group
+  return (tc_gbl_env, new_group)
+
+overload :: Names (Expr.LHsExpr GHC.GhcRn) -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 overload Names{..} (GHC.L l e) = go e
   where
     go (Expr.HsIf _ext _ p te fe) =
