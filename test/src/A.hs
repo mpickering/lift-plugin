@@ -86,12 +86,14 @@ pureTest = overload $ pure (id 5)
 lamTest :: Syntax r => r (a -> a)
 lamTest = overload $ \a -> a
 
-{-
-letTest :: Syntax r => r Bool
-letTest = overload $ let t = True
+-- Test for simple var bind
+-- This is a bit trickier as can't easier make a lambda as for a normal
+-- FunBind
+letTest2 :: Syntax r => r Bool
+letTest2 = overload $ let t = pure True
                      in t
-                     -}
 
+-- Test for fun bind
 letTest :: Syntax r => r Bool
 letTest = overload $ let t x = x
                      in t (pure True)

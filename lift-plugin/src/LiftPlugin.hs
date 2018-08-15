@@ -464,28 +464,46 @@ overloadExpr names@Names{..} le@(GHC.L l e) = go e
       pprTrace "Replacing lam" (ppr e)
        $ GHC.mkHsApp (mkExpr lamName) le
     go (Expr.HsLet _ binds let_rhs) =
-      let (binder, rhs) = extractBindInfo binds
+      let (binder, rhs) = extractBindInfo names binds
           pats = [GHC.noLoc $ GHC.VarPat GHC.noExt binder]
           matches = GHC.mkMatchGroup GHC.Generated [GHC.mkSimpleMatch Expr.LambdaExpr pats let_rhs]
           body_lam = GHC.noLoc $ GHC.HsLam GHC.noExt matches
       in
         pprTrace "Replacing let" (ppr e $$ ppr rhs $$ ppr body_lam )
-          $ foldl' GHC.mkHsApp (mkExpr letName) [overloadExpr names rhs, body_lam]
+          $ foldl' GHC.mkHsApp (mkExpr letName) [rhs, body_lam]
 
     go expr = GHC.L l expr
 
 -- Get the binder and body of let
-extractBindInfo :: GHC.LHsLocalBinds GHC.GhcRn -> (GHC.Located GHC.Name, GHC.LHsExpr GHC.GhcRn)
-extractBindInfo (GHC.L _ (GHC.HsValBinds _ (GHC.XValBindsLR (GHC.NValBinds binds _)))) = getBinds binds
+extractBindInfo :: Names ExprWithName -> GHC.LHsLocalBinds GHC.GhcRn -> (GHC.Located GHC.Name, GHC.LHsExpr GHC.GhcRn)
+extractBindInfo names (GHC.L _ (GHC.HsValBinds _ (GHC.XValBindsLR (GHC.NValBinds binds _)))) = getBinds binds
   where
     getBinds bs =
       let [rs] = map snd bs
       in
       case bagToList rs of
         [GHC.L _ (GHC.FunBind _ bid matches _ _)] ->
-          (bid, GHC.noLoc $ Expr.HsLam GHC.noExt matches)
+          case isSingletonMatchGroup matches >>= simpleGRHS of
+            Just simple -> (bid, simple)
+            _ -> (bid, overloadExpr names (GHC.noLoc $ Expr.HsLam GHC.noExt matches))
+        -- Not dealing with guards here yet but they could be
+        -- transfered onto the lambda
         _ -> panic "abc"
-extractBindInfo e = panicDoc "abc2" (showAstData BlankSrcSpan e)
+extractBindInfo _ e = panicDoc "abc2" (showAstData BlankSrcSpan e)
+
+simpleGRHS :: Expr.GRHS p w -> Maybe w
+simpleGRHS grhs =
+  case grhs of
+    (Expr.GRHS _ [] body) -> Just body
+    _ -> Nothing
 
 
-
+-- | Is there only one RHS in this list of matches?
+isSingletonMatchGroup :: Expr.MatchGroup id body -> Maybe (Expr.GRHS id body)
+isSingletonMatchGroup (Expr.MG { mg_alts = matches })
+  | [GHC.L _ match] <- GHC.unLoc matches
+  , Expr.Match { m_grhss = GHC.GRHSs { grhssGRHSs = [rhs] }
+               , m_pats = [] } <- match
+  = Just (GHC.unLoc rhs)
+  | otherwise
+  = Nothing
