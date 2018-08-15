@@ -75,5 +75,7 @@ test_foo1 = [|| foo1 ||]
 --test3 = pure foo1
 
 ifTest :: Syntax r => r Bool
-ifTest = overload (if (pure True) then (pure False) else (pure True))
+ifTest = overload $ if (pure True) then (pure False) else (pure True)
+
+
 

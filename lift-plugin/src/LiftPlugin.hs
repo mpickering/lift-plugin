@@ -34,6 +34,7 @@ import Bag
 import MonadUtils
 import TcErrors
 import Literal
+import PrelNames
 import qualified Unique as GHC
 import qualified THNames as GHC
 
@@ -398,15 +399,35 @@ overloadedSyntax _opts tc_gbl_env rn_group = do
 pattern VarApp :: GHC.Name -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 pattern VarApp v e <- (GHC.unLoc -> Expr.HsApp _ (GHC.unLoc -> Expr.HsVar _ (GHC.unLoc -> v)) e)
 
+is_dollar :: GHC.Name -> Bool
+is_dollar = (== dollarName)
+
+pattern DollarVarApp :: GHC.Name -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
+pattern DollarVarApp v e <- (GHC.unLoc -> Expr.OpApp _ (GHC.unLoc -> Expr.HsVar _ (GHC.unLoc -> v)) (GHC.unLoc -> Expr.HsVar _ (is_dollar . GHC.unLoc -> True)) e)
+
+
 overload_guard :: Names GHC.Name -> Expr.LHsExpr GHC.GhcRn
                                                  -> Expr.LHsExpr GHC.GhcRn
-overload_guard names@(Names{ overloadName }) old_e@(VarApp v e)
-  | v == overloadName =
+overload_guard names old_e =
+  case old_e of
+    VarApp v e -> check_overload_app names v e old_e
+    DollarVarApp v e -> check_overload_app names v e old_e
+    _ -> old_e
+
+
+check_overload_app :: Names GHC.Name -> GHC.Name -> Expr.LHsExpr GHC.GhcRn
+                                                 -> Expr.LHsExpr GHC.GhcRn
+                                                 -> Expr.LHsExpr GHC.GhcRn
+check_overload_app names@(Names { overloadName } ) v e old_e
+  | v == overloadName = overload_scope names e
+  | otherwise = old_e
+
+overload_scope :: Names GHC.Name -> Expr.LHsExpr GHC.GhcRn
+                                                 -> Expr.LHsExpr GHC.GhcRn
+overload_scope names e =
     let mkVar = GHC.noLoc . Expr.HsVar GHC.noExt . GHC.noLoc
         namesExpr = fmap mkVar names
     in everywhere (mkT (overloadExpr namesExpr)) e
-  | otherwise = old_e
-overload_guard _ e = e
 
 overloadExpr :: Names (Expr.LHsExpr GHC.GhcRn) -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 overloadExpr Names{..} (GHC.L l e) = go e
