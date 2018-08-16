@@ -1,6 +1,8 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{-# OPTIONS_GHC -dcore-lint #-}
 module A where
+
 
 import Prelude hiding (Applicative(..))
 
@@ -8,6 +10,8 @@ import Data.Functor.Identity
 import Language.Haskell.TH.Syntax
 
 import LiftPlugin
+
+default ()
 
 newtype Code a = Code (Q (TExp a))
 
@@ -115,8 +119,16 @@ power n = let r = power (n - 1)
 
 staticPower :: Syntax r => r (Int -> Int -> Int)
 staticPower = overload (\n -> \k ->
-                          if (pure (==)) n (pure 0)
+                          if (pure (==)) (wrap n) (wrap 0)
                                   then pure 1
                                   else (pure (*)) k (staticPower ((pure (-)) n (pure 1))  k))
+
+wrapTest :: Pure r => r (Int -> Int)
+wrapTest = wrap id
+
+wrapTest2 :: Pure r => r (Int -> Int)
+wrapTest2 =  wrap wrapTest
+
+
 
 

@@ -13,13 +13,18 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FunctionalDependencies #-}
 module LiftPlugin
-  ( plugin, Pure(..), Syntax(..), overload )
+  ( plugin, Pure(..), Syntax(..), overload, Wrap(..) )
 where
 
 -- external
 import Data.Maybe          (mapMaybe)
 import GHC.TcPluginM.Extra (lookupModule, lookupName)
+
+import Prelude hiding (pure)
 
 
 -- GHC API
@@ -28,7 +33,7 @@ import Module     (mkModuleName)
 import OccName    (mkTcOcc)
 import Plugins    (Plugin (..), defaultPlugin)
 import TcEvidence
-import TcPluginM  (TcPluginM, tcLookupTyCon)
+import TcPluginM  (TcPluginM, tcLookupTyCon, newWanted, tcLookupId)
 import TcRnTypes
 import TyCon      (TyCon, tyConSingleDataCon)
 import TyCoRep    (Type (..))
@@ -37,7 +42,7 @@ import Class
 import MkCore
 import CoreSyn
 import Bag
-import MonadUtils
+import MonadUtils hiding (pure)
 import TcErrors
 import Literal
 import PrelNames
@@ -49,6 +54,7 @@ import Panic
 
 
 -- ghc
+import qualified TysPrim as GHC
 import qualified Desugar as GHC
 import qualified Finder as GHC
 import qualified GHC hiding (exprType)
@@ -88,6 +94,10 @@ getError k = (!! k) . snd <$> readIORef ioRef
 
 -- Library
 
+class Wrap r a v  where
+  wrap :: (Lift a, Pure r) => v -> r a
+
+
 class Pure r where
   pure :: Lift a => a -> r a
 
@@ -111,7 +121,7 @@ overload = undefined
 {-# NOINLINE overload #-}
 
 data Names a = Names
-  { pureName, ifName, unconsName, lamName, letName, elimProdName, apName
+  { pureName, wrapName, ifName, unconsName, lamName, letName, elimProdName, apName
     , overloadName :: a }
   deriving (Functor, Traversable, Foldable, Generic)
 
@@ -119,6 +129,7 @@ namesString :: Names String
 namesString =
   Names
     { pureName = "pure"
+    , wrapName = "wrap"
     , ifName = "_if"
     , unconsName = "_uncons"
     , lamName = "_lam"
@@ -169,28 +180,44 @@ liftPlugin =
            }
 
 
-lookupLiftTyCon :: TcPluginM TyCon
+lookupLiftTyCon :: TcPluginM (TyCon, TyCon, TyCon, GHC.Id)
 lookupLiftTyCon = do
     md      <- lookupModule liftModule liftPackage
     liftTcNm <- lookupName md (mkTcOcc "Lift")
-    tcLookupTyCon liftTcNm
+    liftTyCon <- tcLookupTyCon liftTcNm
+
+    md_wrap      <- lookupModule wrapModule wrapPackage
+    wrapTcNm <- lookupName md_wrap (mkTcOcc "Wrap")
+    wrapTyCon <- tcLookupTyCon wrapTcNm
+
+    md_pure      <- lookupModule wrapModule wrapPackage
+    pureTcNm <- lookupName md_pure (mkTcOcc "Pure")
+    pureTyCon <- tcLookupTyCon pureTcNm
+
+    pureTcNm <- lookupName md_pure (GHC.mkVarOcc "pure")
+    pureName <- tcLookupId pureTcNm
+    return (liftTyCon, wrapTyCon, pureTyCon, pureName)
   where
     liftModule  = mkModuleName "Language.Haskell.TH.Syntax"
     liftPackage = fsLit "template-haskell"
 
+    wrapModule  = mkModuleName "LiftPlugin"
+    wrapPackage = fsLit "lift-plugin"
+
 
 -- This plugin solves all instances of (Lift (a -> b)) with a dummy value.
-solveLift :: TyCon -- ^ Lift's TyCon
+solveLift :: (TyCon, TyCon, TyCon, GHC.Id) -- ^ Lift's TyCon
          -> [Ct]  -- ^ [G]iven constraints
          -> [Ct]  -- ^ [D]erived constraints
          -> [Ct]  -- ^ [W]anted constraints
          -> TcPluginM TcPluginResult
 solveLift _     _ _ []      = return (TcPluginOk [] [])
-solveLift liftTc gs ds wanteds =
+solveLift (liftTc, wrapTc, pureTc, pureName) gs ds wanteds =
   pprTrace "solveGCD" (ppr gs $$ ppr ds $$ ppr wanteds) $ do
-    res <- mapMaybeM (\c -> fmap (, c) <$> evMagic c) solved
+    res <- mapM (\c -> (, c) <$> evMagic c) solved
+    (wrap_solved, wrap_wanted) <- unzip <$> mapMaybeM (toWrapCt liftTc wrapTc pureTc pureName) wanteds
     return $! case failed of
-      [] -> TcPluginOk res []
+      [] -> TcPluginOk (res ++ wrap_solved) (concat wrap_wanted)
       f  -> TcPluginContradiction f
   where
     liftWanteds :: [Ct]
@@ -198,6 +225,8 @@ solveLift liftTc gs ds wanteds =
 
     solved, failed :: [Ct]
     (solved,failed) = (liftWanteds, [])
+
+{- Solving lift instances -}
 
 toLiftCt :: TyCon -> Ct -> Maybe Ct
 toLiftCt liftTc ct =
@@ -220,28 +249,105 @@ getErrTc k = join (liftIO (getError k))
 
 
 -- | TODO: Check here for (->) instance
-evMagic :: Ct -> TcPluginM (Maybe EvTerm)
-evMagic ct = case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
-    GHC.ClassPred _tc _tys -> do
-      let reporter = reportAllUnsolved (mkWC ct)
-      k <- addErrTc reporter
-      return $ Just (EvExpr (FakeExpr k))
-    _                  -> return Nothing
+evMagic :: Ct -> TcPluginM EvTerm
+evMagic ct = do
+  let reporter = reportAllUnsolved (mkWC ct)
+  k <- addErrTc reporter
+  return $ (EvExpr (FakeExpr (ctPred ct) k))
 
 -- What this is doens't matter really
-fake_id :: GHC.Id
-fake_id = rUNTIME_ERROR_ID
+fakeIdName :: GHC.Name
+fakeIdName = GHC.mkWiredInIdName gHC_MAGIC (fsLit "fake_id") fakeIdKey fakeId
+
+fakeIdKey :: Unique
+fakeIdKey = GHC.mkPreludeMiscIdUnique 109
+
+fakeId :: GHC.Id
+fakeId = GHC.mkVanillaGlobalWithInfo fakeIdName ty info
+  where
+    info = GHC.noCafIdInfo
+    ty = GHC.mkSpecForAllTys [GHC.alphaTyVar] (GHC.mkFunTy GHC.intTy GHC.alphaTy)
+
+fake_id = fakeId
 
 is_fake_id :: GHC.Id -> Bool
 is_fake_id = (== fake_id)
 
-fake_expr :: Int -> Expr GHC.Id
-fake_expr k = App (Var fake_id) (Lit $ LitNumber LitNumInteger (fromIntegral k) GHC.intTy)
+fake_expr :: Type -> Int -> Expr GHC.Id
+fake_expr ty k = mkCoreApps (Var fake_id) [Type ty, (Lit $ LitNumber LitNumInteger (fromIntegral k) GHC.intTy)]
 
-pattern FakeExpr :: Int -> Expr GHC.Id
-pattern FakeExpr k <- App (Var (is_fake_id -> True)) (Lit (LitNumber LitNumInteger (fromIntegral -> k) _))
+pattern FakeExpr :: Type -> Int -> Expr GHC.Id
+pattern FakeExpr ty k <- App (App (Var (is_fake_id -> True)) (Type ty)) (Lit (LitNumber LitNumInteger (fromIntegral -> k) _))
   where
-    FakeExpr k = fake_expr k
+    FakeExpr ty k = fake_expr ty k
+
+{- Solving Wrap instances
+-}
+
+toWrapCt :: TyCon -> TyCon -> TyCon -> GHC.Id -> Ct -> TcPluginM (Maybe ((EvTerm, Ct), [Ct]))
+toWrapCt liftTc wrapTc pureTc pureName ct =
+  case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
+    GHC.ClassPred tc tys
+      | classTyCon tc == wrapTc
+        -> pprTrace "solveWrap" (ppr tys) $ solveWrap liftTc wrapTc pureTc pureName ct tys
+    _ -> return Nothing
+
+solveWrap :: TyCon -> TyCon -> TyCon -> GHC.Id
+          -> Ct -> [Type] -> TcPluginM (Maybe ((EvTerm, Ct), [Ct]))
+solveWrap liftTc wrapTc pureTc pureName ct [t1, t2, t3] =
+  case GHC.splitAppTys t3 of
+    (r, [v]) -> do
+      pprTrace "solveWrap" (ppr (r, v)) (return ())
+      w1 <- newWanted (ctLoc ct) (GHC.mkPrimEqPred t2 v)
+      pprTrace "solveWrap" (ppr (r, v)) (return ())
+      w2 <- newWanted (ctLoc ct) (GHC.mkPrimEqPred t1 r)
+      pprTrace "solveWrap2" (ppr (r, v)) (return ())
+--      pure_c <- newWanted (ctLoc ct) (GHC.mkTyConApp pureTc [t1])
+      pprTrace "solveWrap3" (ppr (r, v)) (return ())
+      return $ Just ((mkEvidence case_1, ct),
+                  [ mkNonCanonical w1
+                  , mkNonCanonical w2 ] )
+                  --, mkNonCanonical pure_c])
+    _ ->  do
+      w1 <- newWanted (ctLoc ct) (GHC.mkPrimEqPred t2 t3)
+      lift_c <- newWanted (ctLoc ct) (GHC.mkTyConApp liftTc [t3])
+      ev <- case_2
+      pprTrace "case_1" (ppr lift_c) (return ())
+      pprTrace "case_2" (ppr ev) (return ())
+      return $ Just ((mkEvidence ev, ct), [mkNonCanonical w1, mkNonCanonical lift_c])
+    _ -> return Nothing
+  where
+    [wrap_dc] = GHC.tyConDataCons wrapTc
+    mkEvidence = EvExpr . mkWrapDictionary wrap_dc t1 t2 t3
+
+    -- Identity function
+    case_1 =
+      let lvar = GHC.mkTemplateLocal 0 t3
+          lvar2 = GHC.mkTemplateLocal 1 (GHC.mkTyConApp liftTc [t2])
+          lvar3 = GHC.mkTemplateLocal 2 (GHC.mkTyConApp pureTc [t1])
+      in mkCoreLams [lvar2, lvar3, lvar] (GHC.Var lvar)
+
+    -- pure, lift, a
+    case_2  = do
+      let val_var = GHC.mkTemplateLocal 0 t3
+          lift_var = GHC.mkTemplateLocal 1 (GHC.mkTyConApp liftTc [t2])
+          pure_var = GHC.mkTemplateLocal 2 (GHC.mkTyConApp pureTc [t1])
+          lift_dict = mkCoreApps (GHC.Var pure_var) [Type t2]
+      return $ mkCoreLams [lift_var, pure_var, val_var]
+        (mkCoreApps (GHC.Var pureName) [Type t1, GHC.Var pure_var, Type t2, GHC.Var lift_var, GHC.Var val_var])
+solveWrap _ _ _ _ _ _ = return Nothing
+
+wrapEvidence :: EvTerm
+wrapEvidence = EvExpr (GHC.Var nO_METHOD_BINDING_ERROR_ID)
+
+-- Wrap r a v :: v -> r a
+mkWrapDictionary :: GHC.DataCon -> Type -> Type -> Type -> CoreExpr -> CoreExpr
+mkWrapDictionary dc t1 t2 t3 body =
+  mkCoreConApps dc [Type t1, Type t2, Type t3, body]
+
+
+
+
 
 -----------------------------------------------------------------------------
 -- The source plugin which fills in the dictionaries magically.
@@ -273,7 +379,7 @@ replaceLiftDicts _opts _sum tc_env = do
   -- We now look everywhere for it and replace the `Lift` dictionaries
   -- where we find it.
   new_tcg_binds <-
-     mkM ( rewriteLiftDict pureName ) `everywhereM` GHC.tcg_binds tc_env
+     mkM ( rewriteLiftDict pureName wrapName ) `everywhereM` GHC.tcg_binds tc_env
 
   -- Check if there are any instances which remain unsolved
   checkUsages (GHC.tcg_ev_binds tc_env) new_tcg_binds
@@ -281,12 +387,16 @@ replaceLiftDicts _opts _sum tc_env = do
   return tc_env { GHC.tcg_binds = new_tcg_binds }
 
 -- |
-rewriteLiftDict :: GHC.Id -> Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
-rewriteLiftDict pName
+rewriteLiftDict :: GHC.Id -> GHC.Id -> Expr.LHsExpr GHC.GhcTc -> GHC.TcM ( Expr.LHsExpr GHC.GhcTc )
+rewriteLiftDict pName wrapName
   e@( GHC.L _ ( Expr.HsApp _ ( GHC.L _ ( Expr.HsWrap _ _ ( Expr.HsVar _ ( GHC.L _ v ) ) ) ) body) )
-    | pName == v
-    = mkM (repair body) `everywhereM` e
-rewriteLiftDict _ e =
+    | pName == v || wrapName == v
+    = mkM (repair wrapClass body) `everywhereM` e
+  where
+    wrapClass = case GHC.idDetails wrapName of
+                  GHC.ClassOpId c -> c
+                  _ -> panic "wrapClass"
+rewriteLiftDict _ _ e =
  -- pprTrace "rewriteAssert" (ppr e $$ showAstData NoBlankSrcSpan e) $
    return e
 
@@ -318,26 +428,48 @@ wrapView _ = Nothing
 -- replace them by a special one which ignores the argument.
 -- The only case we deal with currently is if the `body` is a simple
 -- variable. This won't deal with polymorphic functions yet.
-repair :: Expr.LHsExpr GHC.GhcTc -> GHC.EvExpr -> GHC.TcM (GHC.EvExpr)
-repair expr e = do
-  let e_ty = GHC.exprType e
-      (ty_con, tys) = GHC.splitTyConApp e_ty
-      res = ty_con `GHC.hasKey` GHC.liftClassKey
+repair :: Class -> Expr.LHsExpr GHC.GhcTc -> GHC.EvExpr -> GHC.TcM (GHC.EvExpr)
+repair wrapClass expr e = do
+
   pprTrace "repair" (ppr ty_con $$ ppr tys $$ ppr res) $
-    if (ty_con `GHC.hasKey` GHC.liftClassKey)
-        && GHC.isFunTy (head tys)
-      then do
-        mres <- checkLiftable expr
-        case mres of
-          Just evidence -> return $ mkLiftDictionary (tyConSingleDataCon ty_con) e_ty evidence
-          Nothing -> do
-            makeError expr
-            -- Return e to keep going
-            return e
-            --GHC.panicDoc "skipping" (ppr expr $$ showAstData BlankSrcSpan expr)
-      else
-        pprTrace "skipping1" (ppr expr) $
-        return e
+    if
+      | (ty_con `GHC.hasKey` GHC.liftClassKey)
+          && GHC.isFunTy (head tys)
+          -> repairLiftDict
+      | (ty_con `GHC.hasKey` wrapClassKey)
+          -> case tys of
+              [t1, t2, t3] | GHC.mkAppTy t1 t2 `GHC.eqType` t3 -> return e
+              _ ->
+                pprTrace "wrapDict" (ppr expr $$ ppr tys) $ repairWrapDict
+      | otherwise ->
+          pprTrace "skipping1" (ppr expr) $
+          return e
+  where
+    e_ty = GHC.exprType e
+    (ty_con, tys) = GHC.splitTyConApp e_ty
+    res = ty_con `GHC.hasKey` GHC.liftClassKey
+
+    wrapClassKey = GHC.getUnique wrapClass
+
+    repairLiftDict = do
+      mres <- checkLiftable expr
+      case mres of
+        -- TODO: Remove this HEAD
+        Just evidence -> return $ mkLiftDictionary (tyConSingleDataCon ty_con) (head tys) evidence
+        Nothing -> do
+          makeError expr
+          -- Return e to keep going
+          return e
+
+    repairWrapDict = do
+      mres <- checkLiftable expr
+      let [t1, t2, t3] = tys
+      case mres of
+        -- body here is an application of pure
+---        Just evidence -> return $ mkWrapDictionary (tyConSingleDataCon ty_con) t1 t2 t3 body
+        _ -> do
+        --  makeError expr
+          return e
 
 makeError :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM ()
 makeError (GHC.L l e) =
@@ -383,6 +515,8 @@ mkLiftDictionary dc ty splice =
   let lvar = GHC.mkTemplateLocal 0 ty
   in mkCoreConApps dc [Type ty, mkCoreLams [lvar] splice]
 
+
+
 ---- Checking Usages
 -- TODO: I think we could store the landmine usage from the Ct information
 -- in the type checking plugin
@@ -413,7 +547,7 @@ checkMine uses (v, k) = when (v `elem` uses) (getErrTc k)
 getFakeDicts :: [EvBind] -> [(GHC.EvVar, Int)]
 getFakeDicts = mapMaybe getFakeDict
   where
-    getFakeDict (EvBind r (EvExpr (FakeExpr k)) _) = Just (r, k)
+    getFakeDict (EvBind r (EvExpr (FakeExpr _ k)) _) = Just (r, k)
     getFakeDict _ = Nothing
 
 
@@ -481,6 +615,7 @@ check_pure Names{..} (GHC.L _ e) = go e
   where
     go (Expr.HsApp _exp (GHC.L _ (Expr.HsVar _ name)) _)
       | GHC.unLoc name == ename pureName = True
+      | GHC.unLoc name == ename wrapName = True
     go _ = False
 
 overloadExpr :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
