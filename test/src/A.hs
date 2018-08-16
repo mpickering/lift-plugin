@@ -107,6 +107,10 @@ caseProdTest :: (Syntax r) => r (a, b) -> r a
 caseProdTest ab = overload $ case ab of
                                (a, b) -> a
 
-
+power :: Syntax r => Int -> r (Int -> Int)
+power n = let r = power (n - 1)
+          in overload $ \k -> if (pure (==)) (pure n) (pure 0)
+                              then pure 1
+                              else (pure (*)) k (r k)
 
 
