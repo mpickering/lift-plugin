@@ -113,4 +113,10 @@ power n = let r = power (n - 1)
                               then pure 1
                               else (pure (*)) k (r k)
 
+staticPower :: Syntax r => r (Int -> Int -> Int)
+staticPower = overload (\n -> \k ->
+                          if (pure (==)) n (pure 0)
+                                  then pure 1
+                                  else (pure (*)) k (staticPower ((pure (-)) n (pure 1))  k))
+
 
