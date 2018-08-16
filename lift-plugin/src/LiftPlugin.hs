@@ -142,9 +142,13 @@ data CaseRow = CaseRow { _overloadCase :: (forall a . Names a -> a)
 mkCaseRow :: (forall a . Names a -> a) -> [(GHC.Name, Int)] -> CaseRow
 mkCaseRow sel info = CaseRow sel (sortBy (GHC.stableNameCmp `on` fst) info)
 
+tuple2Name :: GHC.Name
+tuple2Name = GHC.dataConName (GHC.tupleDataCon GHC.Boxed 2)
+
 caseTableInfo :: [CaseRow]
 caseTableInfo =
-  [ mkCaseRow unconsName [(GHC.consDataConName, 2), (GHC.nilDataConName, 0)] ]
+  [ mkCaseRow unconsName [(GHC.consDataConName, 2), (GHC.nilDataConName, 0)]
+  , mkCaseRow elimProdName [(tuple2Name, 2)] ]
 
 
 
@@ -631,4 +635,6 @@ extractFromPat (GHC.L _l p) =
     GHC.ConPatIn (GHC.L _l n) con_pat_details
       -> Right (GHC.hsConPatArgs con_pat_details, n)
     GHC.ParPat _ pp -> extractFromPat pp
+    GHC.TuplePat _ [a, b] GHC.Boxed ->
+      Right ([a, b], tuple2Name)
     _ -> Left "Complex pattern"

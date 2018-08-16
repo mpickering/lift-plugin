@@ -103,6 +103,10 @@ caseTest xs = overload $ case xs of
                           [] -> (pure False)
                           (_:_) -> (pure True)
 
+caseProdTest :: (Syntax r) => r (a, b) -> r a
+caseProdTest ab = overload $ case ab of
+                               (a, b) -> a
+
 
 
 
