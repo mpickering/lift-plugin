@@ -8,6 +8,11 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE MultiWayIf #-}
 module LiftPlugin
   ( plugin, Pure(..), Syntax(..), overload )
 where
@@ -57,10 +62,12 @@ import Control.Monad.IO.Class ( liftIO )
 import Control.Monad
 
 import Data.Generics ( everywhereM,  mkM, listify, everywhere, mkT
-                     , everywhereBut, mkQ )
+                     , everywhereBut, mkQ, Data )
 import Data.List
 
 import GHC.Generics
+
+import Data.Function
 
 
 import Language.Haskell.TH.Syntax (Lift(..))
@@ -94,7 +101,7 @@ class (Pure r) => Syntax r where
 
 
   -- Case overloading
-  _uncons ::  r [a] -> (r a -> r [a] -> r res) -> r res -> r res
+  _uncons ::  r [a] -> r res -> (r a -> r [a] -> r res) -> r res
   _elim_prod :: r (a, b) -> (r a -> r b -> r x) -> r x
 
 
@@ -119,6 +126,27 @@ namesString =
     , apName = "_ap"
     , overloadName = "overload"
     }
+
+
+-- Maps a representative name to the ordering and constructors we expect
+-- with their arity
+caseTable :: GHC.NameEnv CaseRow
+caseTable = GHC.mkNameEnv [(fst (head (caseInfo ci)), ci) | ci <- caseTableInfo ]
+
+data CaseRow = CaseRow { overloadCase :: (forall a . Names a -> a)
+                       , caseInfo :: [(GHC.Name, Int)]
+                       }
+
+-- mkCaseRow enforces the ordering invariant
+mkCaseRow :: (forall a . Names a -> a) -> [(GHC.Name, Int)] -> CaseRow
+mkCaseRow sel info = CaseRow sel (sortBy (GHC.stableNameCmp `on` fst) info)
+
+caseTableInfo :: [CaseRow]
+caseTableInfo =
+  [ mkCaseRow unconsName [(GHC.consDataConName, 2), (GHC.nilDataConName, 0)] ]
+
+
+
 
 
 -- Plugin definitions
@@ -466,13 +494,39 @@ overloadExpr names@Names{..} le@(GHC.L l e) = go e
     go (Expr.HsLet _ binds let_rhs) =
       let (binder, rhs) = extractBindInfo names binds
           pats = [GHC.noLoc $ GHC.VarPat GHC.noExt binder]
-          matches = GHC.mkMatchGroup GHC.Generated [GHC.mkSimpleMatch Expr.LambdaExpr pats let_rhs]
-          body_lam = GHC.noLoc $ GHC.HsLam GHC.noExt matches
+          body_lam = mkHsLam pats let_rhs
       in
         pprTrace "Replacing let" (ppr e $$ ppr rhs $$ ppr body_lam )
           $ foldl' GHC.mkHsApp (mkExpr letName) [rhs, body_lam]
 
+    go expr@(Expr.HsCase ext scrut mg) =
+      let v = caseDataCon names scrut mg
+      in case v of
+           Left v -> panic v
+           Right res -> res
+
     go expr = GHC.L l expr
+
+mkHsLam :: [GHC.LPat GHC.GhcRn] -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr (GHC.GhcRn)
+mkHsLam pats body = mkHsLamGRHS pats (GHC.unguardedGRHSs body)
+
+mkHsLamGRHS :: [GHC.LPat GHC.GhcRn] -> Expr.GRHSs GHC.GhcRn (GHC.LHsExpr GHC.GhcRn)
+                                    -> Expr.LHsExpr (GHC.GhcRn)
+mkHsLamGRHS [] (Expr.GRHSs { grhssGRHSs = grhs, grhssLocalBinds = (GHC.L _ (GHC.EmptyLocalBinds _)) }) =
+  case grhs of
+    [GHC.L _ grhs] -> case simpleGRHS grhs of
+                Just e -> e
+                Nothing -> panic "GRHS is not simple2"
+
+    _ -> panic "GRHS is not simple"
+mkHsLamGRHS pats grhs = body_lam
+  where
+    matches = GHC.mkMatchGroup GHC.Generated [mkGRHSMatch pats grhs]
+    body_lam = GHC.noLoc $ GHC.HsLam GHC.noExt matches
+
+mkGRHSMatch pats rhs = GHC.noLoc $ GHC.Match GHC.noExt GHC.LambdaExpr pats rhs
+
+{- Code for dealing with let -}
 
 -- Get the binder and body of let
 extractBindInfo :: Names ExprWithName -> GHC.LHsLocalBinds GHC.GhcRn -> (GHC.Located GHC.Name, GHC.LHsExpr GHC.GhcRn)
@@ -508,3 +562,67 @@ isSimpleMatchGroup (Expr.MG { mg_alts = matches })
   = simpleGRHS (GHC.unLoc rhs)
   | otherwise
   = Nothing
+
+{- Code for dealing with case -}
+
+sd :: Data a => a -> SDoc
+sd = showAstData BlankSrcSpan
+
+--deriving instance Data p => Data (Expr.Match p (Expr.LHsExpr p))
+
+-- Look at a case and see if it's a simple match on a data con
+caseDataCon :: Names ExprWithName
+            -> Expr.LHsExpr (GHC.GhcRn)
+            -> Expr.MatchGroup (GHC.GhcRn) (Expr.LHsExpr (GHC.GhcRn))
+            -> Either String (GHC.LHsExpr GHC.GhcRn)
+caseDataCon names scrut (Expr.MG { mg_alts = (GHC.L l alts) }) = do
+  res <- sortBy (\(_, n, _) (_, n1, _)-> GHC.stableNameCmp n n1) <$>
+              (mapM (extractConDetails . GHC.unLoc) $ alts)
+  case res of
+    [] -> Left "No patterns"
+    ps@((_, n, _):_) ->
+      case GHC.lookupNameEnv caseTable n of
+        Nothing -> Left "Not able to overload this constructor"
+        Just (CaseRow sel spec) ->
+          let con = GHC.mkHsApp (mkExpr (sel names)) scrut
+          in checkAndBuild con ps spec
+
+checkAndBuild :: Expr.LHsExpr GHC.GhcRn -- The constructor
+              -> [([GHC.LPat GHC.GhcRn], GHC.Name
+                                       , Expr.GRHSs GHC.GhcRn (GHC.LHsExpr GHC.GhcRn))]
+              -> [(GHC.Name, Int)]
+              -> Either String (Expr.LHsExpr GHC.GhcRn)
+checkAndBuild con [] [] = Right con
+checkAndBuild _con (_:_) [] = Left "Too many patterns in program"
+checkAndBuild _con [] (_:_) = Left "Not enough patterns in program"
+checkAndBuild con (p:ps) (s:ss) = do
+  res <- checkAndBuild con ps ss
+  let (pats, con, rhs) = p
+      (spec_con, arity) = s
+  if | con /= spec_con -> Left "Constructors do not match"
+     | length pats /= arity -> Left "Arity does not patch"
+     | otherwise -> Right (GHC.mkHsApp res (mkHsLamGRHS pats rhs))
+
+
+
+
+
+
+
+
+-- Extract, binders, con name and rhs
+extractConDetails :: Expr.Match GHC.GhcRn body
+                  -> Either String ([GHC.LPat GHC.GhcRn], GHC.Name, Expr.GRHSs GHC.GhcRn body)
+-- There should only be one pattern in a case
+extractConDetails (Expr.Match { m_pats = [pat], m_grhss = rhs }) = do
+  (vars, cn) <- extractFromPat pat
+  return (vars, cn, rhs)
+extractConDetails _ = Left "More than one match"
+
+extractFromPat :: GHC.LPat GHC.GhcRn -> Either String ([GHC.LPat GHC.GhcRn], GHC.Name)
+extractFromPat (GHC.L l p) =
+  case p of
+    GHC.ConPatIn (GHC.L l n) con_pat_details
+      -> Right (GHC.hsConPatArgs con_pat_details, n)
+    GHC.ParPat _ p -> extractFromPat p
+    _ -> Left "Complex pattern"

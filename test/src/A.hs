@@ -98,5 +98,11 @@ letTest :: Syntax r => r Bool
 letTest = overload $ let t x = x
                      in t (pure True)
 
+caseTest :: (Syntax r) => r [a] -> r Bool
+caseTest xs = overload $ case xs of
+                          [] -> (pure False)
+                          (_:_) -> (pure True)
+
+
 
 
