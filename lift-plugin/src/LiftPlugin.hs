@@ -62,7 +62,7 @@ import Control.Monad.IO.Class ( liftIO )
 import Control.Monad
 
 import Data.Generics ( everywhereM,  mkM, listify, everywhere, mkT
-                     , everywhereBut, mkQ, Data )
+                     , everywhereBut, mkQ )
 import Data.List
 
 import GHC.Generics
@@ -105,6 +105,7 @@ class (Pure r) => Syntax r where
   _elim_prod :: r (a, b) -> (r a -> r b -> r x) -> r x
 
 
+
 overload :: Syntax r => a -> r a
 overload = undefined
 {-# NOINLINE overload #-}
@@ -133,7 +134,7 @@ namesString =
 caseTable :: GHC.NameEnv CaseRow
 caseTable = GHC.mkNameEnv [(fst (head (caseInfo ci)), ci) | ci <- caseTableInfo ]
 
-data CaseRow = CaseRow { overloadCase :: (forall a . Names a -> a)
+data CaseRow = CaseRow { _overloadCase :: (forall a . Names a -> a)
                        , caseInfo :: [(GHC.Name, Int)]
                        }
 
@@ -499,11 +500,11 @@ overloadExpr names@Names{..} le@(GHC.L l e) = go e
         pprTrace "Replacing let" (ppr e $$ ppr rhs $$ ppr body_lam )
           $ foldl' GHC.mkHsApp (mkExpr letName) [rhs, body_lam]
 
-    go expr@(Expr.HsCase ext scrut mg) =
-      let v = caseDataCon names scrut mg
-      in case v of
-           Left v -> panic v
-           Right res -> res
+    go (Expr.HsCase _ext scrut mg) =
+      let res = caseDataCon names scrut mg
+      in case res of
+           Left err -> panic err
+           Right expr -> expr
 
     go expr = GHC.L l expr
 
@@ -512,8 +513,8 @@ mkHsLam pats body = mkHsLamGRHS pats (GHC.unguardedGRHSs body)
 
 mkHsLamGRHS :: [GHC.LPat GHC.GhcRn] -> Expr.GRHSs GHC.GhcRn (GHC.LHsExpr GHC.GhcRn)
                                     -> Expr.LHsExpr (GHC.GhcRn)
-mkHsLamGRHS [] (Expr.GRHSs { grhssGRHSs = grhs, grhssLocalBinds = (GHC.L _ (GHC.EmptyLocalBinds _)) }) =
-  case grhs of
+mkHsLamGRHS [] (Expr.GRHSs { grhssGRHSs = grhss, grhssLocalBinds = (GHC.L _ (GHC.EmptyLocalBinds _)) }) =
+  case grhss of
     [GHC.L _ grhs] -> case simpleGRHS grhs of
                 Just e -> e
                 Nothing -> panic "GRHS is not simple2"
@@ -524,6 +525,9 @@ mkHsLamGRHS pats grhs = body_lam
     matches = GHC.mkMatchGroup GHC.Generated [mkGRHSMatch pats grhs]
     body_lam = GHC.noLoc $ GHC.HsLam GHC.noExt matches
 
+mkGRHSMatch :: (GHC.XCMatch p body ~ GHC.NoExt) =>
+                     [GHC.LPat p]
+                     -> Expr.GRHSs p body -> GHC.Located (Expr.Match p body)
 mkGRHSMatch pats rhs = GHC.noLoc $ GHC.Match GHC.noExt GHC.LambdaExpr pats rhs
 
 {- Code for dealing with let -}
@@ -562,11 +566,12 @@ isSimpleMatchGroup (Expr.MG { mg_alts = matches })
   = simpleGRHS (GHC.unLoc rhs)
   | otherwise
   = Nothing
+isSimpleMatchGroup (Expr.XMatchGroup _) = panic "unhandled"
 
 {- Code for dealing with case -}
 
-sd :: Data a => a -> SDoc
-sd = showAstData BlankSrcSpan
+--sd :: Data a => a -> SDoc
+--sd = showAstData BlankSrcSpan
 
 --deriving instance Data p => Data (Expr.Match p (Expr.LHsExpr p))
 
@@ -575,7 +580,7 @@ caseDataCon :: Names ExprWithName
             -> Expr.LHsExpr (GHC.GhcRn)
             -> Expr.MatchGroup (GHC.GhcRn) (Expr.LHsExpr (GHC.GhcRn))
             -> Either String (GHC.LHsExpr GHC.GhcRn)
-caseDataCon names scrut (Expr.MG { mg_alts = (GHC.L l alts) }) = do
+caseDataCon names scrut (Expr.MG { mg_alts = (GHC.L _l alts) }) = do
   res <- sortBy (\(_, n, _) (_, n1, _)-> GHC.stableNameCmp n n1) <$>
               (mapM (extractConDetails . GHC.unLoc) $ alts)
   case res of
@@ -586,6 +591,7 @@ caseDataCon names scrut (Expr.MG { mg_alts = (GHC.L l alts) }) = do
         Just (CaseRow sel spec) ->
           let con = GHC.mkHsApp (mkExpr (sel names)) scrut
           in checkAndBuild con ps spec
+caseDataCon _ _ (Expr.XMatchGroup _) = panic "unhandled"
 
 checkAndBuild :: Expr.LHsExpr GHC.GhcRn -- The constructor
               -> [([GHC.LPat GHC.GhcRn], GHC.Name
@@ -597,9 +603,9 @@ checkAndBuild _con (_:_) [] = Left "Too many patterns in program"
 checkAndBuild _con [] (_:_) = Left "Not enough patterns in program"
 checkAndBuild con (p:ps) (s:ss) = do
   res <- checkAndBuild con ps ss
-  let (pats, con, rhs) = p
+  let (pats, pat_con, rhs) = p
       (spec_con, arity) = s
-  if | con /= spec_con -> Left "Constructors do not match"
+  if | pat_con /= spec_con -> Left "Constructors do not match"
      | length pats /= arity -> Left "Arity does not patch"
      | otherwise -> Right (GHC.mkHsApp res (mkHsLamGRHS pats rhs))
 
@@ -620,9 +626,9 @@ extractConDetails (Expr.Match { m_pats = [pat], m_grhss = rhs }) = do
 extractConDetails _ = Left "More than one match"
 
 extractFromPat :: GHC.LPat GHC.GhcRn -> Either String ([GHC.LPat GHC.GhcRn], GHC.Name)
-extractFromPat (GHC.L l p) =
+extractFromPat (GHC.L _l p) =
   case p of
-    GHC.ConPatIn (GHC.L l n) con_pat_details
+    GHC.ConPatIn (GHC.L _l n) con_pat_details
       -> Right (GHC.hsConPatArgs con_pat_details, n)
-    GHC.ParPat _ p -> extractFromPat p
+    GHC.ParPat _ pp -> extractFromPat pp
     _ -> Left "Complex pattern"
