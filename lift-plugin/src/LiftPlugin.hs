@@ -215,13 +215,35 @@ solveLift _     _ _ []      = return (TcPluginOk [] [])
 solveLift (liftTc, wrapTc, pureTc, pureName) gs ds wanteds =
   pprTrace "solveGCD" (ppr gs $$ ppr ds $$ ppr wanteds) $ do
     res <- mapM (\c -> (, c) <$> evMagic c) solved
-    (wrap_solved, wrap_wanted) <- unzip <$> mapMaybeM (toWrapCt liftTc wrapTc pureTc pureName) wanteds
+    (wrap_solved, wrap_wanted) <- unzip <$> mapMaybeM solveWrapGroup (groupWanteds wanteds)
     return $! case failed of
-      [] -> TcPluginOk (res ++ wrap_solved) (concat wrap_wanted)
+      [] -> TcPluginOk (res ++ concat wrap_solved) (concat wrap_wanted)
       f  -> TcPluginContradiction f
   where
     liftWanteds :: [Ct]
     liftWanteds = mapMaybe (toLiftCt liftTc) wanteds
+
+
+    irrev_ev ct = EvExpr $ mkCoreApps (GHC.Var rEC_SEL_ERROR_ID)
+                    [Type GHC.liftedTypeKind, Type (ctPred ct), mkNilExpr GHC.charTy]
+
+    solveWrapGroup :: (Ct, [Ct]) -> TcPluginM (Maybe ([(EvTerm, Ct)], [Ct]))
+    solveWrapGroup (wrapCt, other_cts) = do
+      res <- toWrapCt liftTc wrapTc pureTc pureName wrapCt
+      return $ case res of
+        Just (ev, more) -> Just ((ev, wrapCt) : map (\ct -> (irrev_ev ct,ct )) other_cts, more)
+        Nothing -> Nothing
+
+
+    -- Group Wrap Cts and any constraints they also give rise to
+    groupWanteds :: [Ct] -> [(Ct, [Ct])]
+    groupWanteds cts = map (\w -> (w, group w)) wraps
+      where
+        (wraps, not_wraps) = partition (isWrapCt wrapTc) cts
+
+        group wrap = filter (\ct -> ctLocSpan (ctLoc ct) == wrap_span) not_wraps
+          where
+            wrap_span = ctLocSpan (ctLoc wrap)
 
     solved, failed :: [Ct]
     (solved,failed) = (liftWanteds, [])
@@ -236,7 +258,11 @@ toLiftCt liftTc ct =
      , classTyCon tc == liftTc
      , [ty] <- tys
      , GHC.isFunTy ty
-      -> Just ct
+      -> do
+        pprTrace "lift-loc" (ppr (ctOrigin ct)) (return ())
+        pprTrace "lift-loc" (ppr (ctLocSpan (ctLoc ct))) (return ())
+        pprTrace "lift-loc" (ppr (cc_tyargs ct)) (return ())
+        Just ct
     _ -> Nothing
 
 mkWC :: Ct -> WantedConstraints
@@ -284,7 +310,13 @@ pattern FakeExpr ty k <- App (App (Var (is_fake_id -> True)) (Type ty)) (Lit (Li
 {- Solving Wrap instances
 -}
 
-toWrapCt :: TyCon -> TyCon -> TyCon -> GHC.Id -> Ct -> TcPluginM (Maybe ((EvTerm, Ct), [Ct]))
+isWrapCt :: TyCon -> Ct -> Bool
+isWrapCt wrapTc ct =
+  case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
+    GHC.ClassPred tc tys -> classTyCon tc == wrapTc
+    _ -> False
+
+toWrapCt :: TyCon -> TyCon -> TyCon -> GHC.Id -> Ct -> TcPluginM (Maybe (EvTerm, [Ct]))
 toWrapCt liftTc wrapTc pureTc pureName ct =
   case GHC.classifyPredType $ ctEvPred $ ctEvidence ct of
     GHC.ClassPred tc tys
@@ -293,7 +325,7 @@ toWrapCt liftTc wrapTc pureTc pureName ct =
     _ -> return Nothing
 
 solveWrap :: TyCon -> TyCon -> TyCon -> GHC.Id
-          -> Ct -> [Type] -> TcPluginM (Maybe ((EvTerm, Ct), [Ct]))
+          -> Ct -> [Type] -> TcPluginM (Maybe ((EvTerm, [Ct])))
 solveWrap liftTc wrapTc pureTc pureName ct [t1, t2, t3] =
   case GHC.splitAppTys t3 of
     (r, [v]) -> do
@@ -304,21 +336,31 @@ solveWrap liftTc wrapTc pureTc pureName ct [t1, t2, t3] =
       pprTrace "solveWrap2" (ppr (r, v)) (return ())
 --      pure_c <- newWanted (ctLoc ct) (GHC.mkTyConApp pureTc [t1])
       pprTrace "solveWrap3" (ppr (r, v)) (return ())
-      return $ Just ((mkEvidence case_1, ct),
+      pprTrace "ct-loc" (ppr (ctOrigin ct)) (return ())
+      pprTrace "ct-loc" (ppr (ctLocSpan (ctLoc ct))) (return ())
+      pprTrace "ct-loc" (ppr ([t1, t2, t3])) (return ())
+      pprTrace "ct-loc" (ppr (fake_lift_ct)) (return ())
+      fake_ev <- evMagic ct
+      return $ Just ((mkEvidence case_1,
                   [ mkNonCanonical w1
-                  , mkNonCanonical w2 ] )
+                  , mkNonCanonical w2 ] ))
                   --, mkNonCanonical pure_c])
     _ ->  do
       w1 <- newWanted (ctLoc ct) (GHC.mkPrimEqPred t2 t3)
-      lift_c <- newWanted (ctLoc ct) (GHC.mkTyConApp liftTc [t3])
+      --lift_c <- newWanted (ctLoc ct) (GHC.mkTyConApp liftTc [t3])
       ev <- case_2
-      pprTrace "case_1" (ppr lift_c) (return ())
+--      pprTrace "case_1" (ppr lift_c) (return ())
       pprTrace "case_2" (ppr ev) (return ())
-      return $ Just ((mkEvidence ev, ct), [mkNonCanonical w1, mkNonCanonical lift_c])
+      return $ Just ((mkEvidence ev, [mkNonCanonical w1]))
     _ -> return Nothing
   where
     [wrap_dc] = GHC.tyConDataCons wrapTc
     mkEvidence = EvExpr . mkWrapDictionary wrap_dc t1 t2 t3
+
+    -- The important fields here are the middle two, the rest is to avoid
+    -- panics
+    Just liftClass = GHC.tyConClass_maybe liftTc
+    fake_lift_ct = CDictCan (ctEvidence ct) liftClass [t2] False
 
     -- Identity function
     case_1 =
@@ -431,7 +473,7 @@ wrapView _ = Nothing
 repair :: Class -> Expr.LHsExpr GHC.GhcTc -> GHC.EvExpr -> GHC.TcM (GHC.EvExpr)
 repair wrapClass expr e = do
 
-  pprTrace "repair" (ppr ty_con $$ ppr tys $$ ppr res) $
+  pprTrace "repair" (ppr expr $$ ppr ty_con $$ ppr tys $$ ppr res) $
     if
       | (ty_con `GHC.hasKey` GHC.liftClassKey)
           && GHC.isFunTy (head tys)
@@ -452,11 +494,13 @@ repair wrapClass expr e = do
     wrapClassKey = GHC.getUnique wrapClass
 
     repairLiftDict = do
+      pprTrace "repairLiftDict" (ppr tys) (return ())
       mres <- checkLiftable expr
       case mres of
         -- TODO: Remove this HEAD
         Just evidence -> return $ mkLiftDictionary (tyConSingleDataCon ty_con) (head tys) evidence
         Nothing -> do
+          pprTrace "repairLiftDict" (ppr tys) (return ())
           makeError expr
           -- Return e to keep going
           return e
@@ -644,6 +688,18 @@ overloadExpr names@Names{..} le@(GHC.L l e) = go e
            Left err -> panic err
            Right expr -> expr
 
+    go (Expr.HsVar {}) =
+      pprTrace "Wrapping var" (ppr e)
+        $ GHC.mkHsApp (mkExpr wrapName) le
+
+    go (Expr.HsLit {}) =
+      pprTrace "Wrapping lit" (ppr e)
+        $ GHC.mkHsApp (mkExpr wrapName) le
+    go (Expr.HsOverLit {}) =
+      pprTrace "Wrapping over lit" (ppr e)
+        $ GHC.mkHsApp (mkExpr wrapName) le
+
+
     go expr = GHC.L l expr
 
 mkHsLam :: [GHC.LPat GHC.GhcRn] -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr (GHC.GhcRn)
@@ -772,3 +828,4 @@ extractFromPat (GHC.L _l p) =
     GHC.TuplePat _ [a, b] GHC.Boxed ->
       Right ([a, b], tuple2Name)
     _ -> Left "Complex pattern"
+

@@ -1,6 +1,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE NoImplicitPrelude #-}
-{-# OPTIONS_GHC -dcore-lint #-}
+{- OPTIONS_GHC -dcore-lint #-}
 module A where
 
 
@@ -93,9 +93,11 @@ lamTest = overload $ \a -> a
 -- Test for simple var bind
 -- This is a bit trickier as can't easier make a lambda as for a normal
 -- FunBind
+{-
 letTest2 :: Syntax r => r Bool
 letTest2 = overload $ let t = pure True
                      in t
+                     -}
 
 -- Test for fun bind
 letTest :: Syntax r => r Bool
@@ -111,17 +113,29 @@ caseProdTest :: (Syntax r) => r (a, b) -> r a
 caseProdTest ab = overload $ case ab of
                                (a, b) -> a
 
+{-
 power :: Syntax r => Int -> r (Int -> Int)
-power n = let r = power (n - 1)
-          in overload $ \k -> if (pure (==)) (pure n) (pure 0)
+power n = overload $ \k -> if (pure (==)) (pure n) (pure 0)
                               then pure 1
-                              else (pure (*)) k (r k)
+                              else (pure (*)) k (power (n-1) k)
+                              -}
+
+{-
+power :: Syntax r => Int -> r (Int -> Int)
+power n = overload $ \k -> if (==) n 0
+                              then 1
+                              else (*) k (static (power (n-1)) k)
+                              -}
 
 staticPower :: Syntax r => r (Int -> Int -> Int)
 staticPower = overload (\n -> \k ->
                           if (pure (==)) (wrap n) (wrap 0)
                                   then pure 1
                                   else (pure (*)) k (staticPower ((pure (-)) n (pure 1))  k))
+
+staticPower2 :: Syntax r => r (Int -> Int -> Int)
+staticPower2 = overload (\n -> \k ->
+                          if (==) n 0 then 1 else (*) k (staticPower2 ((-) n 1) k))
 
 wrapTest :: Pure r => r (Int -> Int)
 wrapTest = wrap id
