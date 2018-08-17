@@ -621,7 +621,6 @@ check_pure Names{..} (GHC.L _ e) = go e
 overloadExpr :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
 overloadExpr names@Names{..} le@(GHC.L l e) = go e
   where
-    -- Don't replace applications of `pure x`.
     go (Expr.HsIf _ext _ p te fe) =
       pprTrace "Replacing if" (ppr e)
        $ foldl' GHC.mkHsApp (mkExpr ifName) [p, te, fe]
