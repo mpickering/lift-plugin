@@ -1,6 +1,8 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE NoImplicitPrelude #-}
+{- OPTIONS_GHC -dcore-lint #-}
 module A where
+
 
 import Prelude hiding (Applicative(..))
 

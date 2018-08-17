@@ -57,6 +57,7 @@ import qualified HsExpr as Expr
 import qualified IfaceEnv as GHC
 import qualified TcEvidence as GHC
 import qualified TcRnMonad as GHC
+import qualified TysPrim as GHC
 
 import Control.Monad.IO.Class ( liftIO )
 import Control.Monad
@@ -188,7 +189,7 @@ solveLift :: TyCon -- ^ Lift's TyCon
 solveLift _     _ _ []      = return (TcPluginOk [] [])
 solveLift liftTc gs ds wanteds =
   pprTrace "solveGCD" (ppr gs $$ ppr ds $$ ppr wanteds) $ do
-    res <- mapMaybeM (\c -> fmap (, c) <$> evMagic c) solved
+    res <- mapM (\c -> (, c) <$> evMagic c) solved
     return $! case failed of
       [] -> TcPluginOk res []
       f  -> TcPluginContradiction f
@@ -422,7 +423,7 @@ checkMine uses (v, k) = when (v `elem` uses) (getErrTc k)
 getFakeDicts :: [EvBind] -> [(GHC.EvVar, Int)]
 getFakeDicts = mapMaybe getFakeDict
   where
-    getFakeDict (EvBind r (EvExpr (FakeExpr k)) _) = Just (r, k)
+    getFakeDict (EvBind r (EvExpr (FakeExpr _ k)) _) = Just (r, k)
     getFakeDict _ = Nothing
 
 
@@ -490,7 +491,6 @@ check_pure Names{..} (GHC.L _ e) = go e
   where
     go (Expr.HsApp _exp (GHC.L _ (Expr.HsVar _ name)) _)
       | GHC.unLoc name == ename pureName = True
-      | GHC.unLoc name == ename wrapName = True
     go _ = False
 
 overloadExpr :: Names ExprWithName -> Expr.LHsExpr GHC.GhcRn -> Expr.LHsExpr GHC.GhcRn
@@ -518,18 +518,6 @@ overloadExpr names@Names{..} le@(GHC.L l e) = go e
       in case res of
            Left err -> panic err
            Right expr -> expr
-
-    go (Expr.HsVar {}) =
-      pprTrace "Wrapping var" (ppr e)
-        $ GHC.mkHsApp (mkExpr wrapName) le
-
-    go (Expr.HsLit {}) =
-      pprTrace "Wrapping lit" (ppr e)
-        $ GHC.mkHsApp (mkExpr wrapName) le
-    go (Expr.HsOverLit {}) =
-      pprTrace "Wrapping over lit" (ppr e)
-        $ GHC.mkHsApp (mkExpr wrapName) le
-
 
     go expr = GHC.L l expr
 
