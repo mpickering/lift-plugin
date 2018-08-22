@@ -45,6 +45,8 @@ import HsDumpAst
 import qualified Unique as GHC
 import qualified THNames as GHC
 
+import qualified IdiomsPlugin as Idioms
+
 import Panic
 
 
@@ -158,7 +160,8 @@ caseTableInfo =
 -- Plugin definitions
 
 plugin :: Plugin
-plugin = defaultPlugin { renamedResultAction = overloadedSyntax
+plugin = defaultPlugin { parsedResultAction = parsedResultAction (Idioms.plugin)
+                       , renamedResultAction = overloadedSyntax
                        , tcPlugin = const (Just liftPlugin)
                        , typeCheckResultAction = replaceLiftDicts }
 

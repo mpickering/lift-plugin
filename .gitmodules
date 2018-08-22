@@ -1,0 +1,3 @@
+[submodule "idioms-plugins"]
+	path = idioms-plugins
+	url = https://github.com/mpickering/idioms-plugins

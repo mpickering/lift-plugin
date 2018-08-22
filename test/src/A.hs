@@ -121,4 +121,15 @@ staticPower = overload (\n -> \k ->
                                   then pure 1
                                   else (pure (*)) k (staticPower ((pure (-)) n (pure 1))  k))
 
+(<*>) :: Syntax r => r (a -> b) -> r a -> r b
+(<*>) = _ap
+
+staticPowerId :: Syntax r => r (Int -> Int -> Int)
+staticPowerId = overload (\n -> \k ->
+                          if ([ n == pure 0 ])
+                                then pure 1
+                                else
+                                  let sp = staticPowerId <*> ([ n - (pure 1) ]) <*> k
+                                  in ([ k * sp ]))
+
 
