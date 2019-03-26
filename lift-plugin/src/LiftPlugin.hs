@@ -92,7 +92,7 @@ getError k = (!! k) . snd <$> readIORef ioRef
 -- Library
 
 class Pure r where
-  pure :: Lift a => a -> r a
+  lift' :: Lift a => a -> r a
 
 -- Syntax we can overload
 class (Pure r) => Syntax r where
@@ -121,7 +121,7 @@ data Names a = Names
 namesString :: Names String
 namesString =
   Names
-    { pureName = "pure"
+    { pureName = "lift'"
     , ifName = "_if"
     , unconsName = "_uncons"
     , lamName = "_lam"
